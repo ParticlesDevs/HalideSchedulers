@@ -5055,8 +5055,8 @@ MachineParams::MachineParams(const std::string &s) {
 // constructor.
 struct RegisterAutoscheduler {
     RegisterAutoscheduler() {
-        std::cout << "Registering autoscheduler 'Sioutas20'...\n";
-        Pipeline::add_autoscheduler("Sioutas20", *this);
+        std::cout << "Registering autoscheduler 'Sioutas2020'...\n";
+        Pipeline::add_autoscheduler("Sioutas2020", *this);
     }
 
     void operator()(const Pipeline &p, const Target &target, const MachineParams &params, AutoSchedulerResults *results) {
@@ -5068,7 +5068,7 @@ struct RegisterAutoscheduler {
     }
 } register_auto_scheduler;*/
 
-struct Sioutas20 {
+struct Sioutas2020 {
     void operator()(const Pipeline &pipeline, const Target &target, const MachineParams &arch_params, AutoSchedulerResults *outputs) {
         AutoSchedulerResults results;
         results.target = target;
@@ -5076,7 +5076,7 @@ struct Sioutas20 {
 
         /*        user_assert(target.arch == Target::X86 || target.arch == Target::ARM ||
                     target.arch == Target::POWERPC || target.arch == Target::MIPS)
-            << "The Sioutas20 autoscheduler is not supported for the target: " << target.to_string(); */
+            << "The Sioutas2020 autoscheduler is not supported for the target: " << target.to_string(); */
         results.scheduler_name = "Sioutas2020";
         std::vector<Function> pipeline_outputs = auto_data_transform(pipeline);
         // std::vector<Function> pipeline_outputs;
@@ -5091,7 +5091,7 @@ struct Sioutas20 {
     }
 };
 
-REGISTER_AUTOSCHEDULER(Sioutas20)
+REGISTER_AUTOSCHEDULER(Sioutas2020)
 
 }  //namespace Internal
 

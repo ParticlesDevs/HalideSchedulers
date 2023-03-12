@@ -22,9 +22,9 @@ add_halide_library(train_cost_model FROM cost_model.generator
 
 # retrain_cost_model
 add_executable(retrain_cost_model
-               ASLog.cpp
+        ../common/ASLog.cpp
                DefaultCostModel.cpp
-               Weights.cpp
+            ../common/Weights.cpp
                retrain_cost_model.cpp
                ${WF_CPP})
 target_link_libraries(retrain_cost_model PRIVATE cost_model train_cost_model Halide::Halide Halide::Plugin)
@@ -35,12 +35,12 @@ target_link_libraries(retrain_cost_model PRIVATE cost_model train_cost_model Hal
 
 add_autoscheduler(NAME Adams2019
                   SOURCES
-                  ASLog.cpp
+        ../common/ASLog.cpp
                   AutoSchedule.cpp
                   DefaultCostModel.cpp
                   FunctionDAG.cpp
                   LoopNest.cpp
-                  Weights.cpp
+        ../common/Weights.cpp
                   ${WF_CPP})
 
 target_link_libraries(Halide_Adams2019 PRIVATE cost_model train_cost_model)
@@ -101,7 +101,7 @@ add_executable(featurization_to_sample featurization_to_sample.cpp)
 add_executable(get_host_target get_host_target.cpp)
 target_link_libraries(get_host_target PRIVATE Halide::Halide)
 
-add_executable(weightsdir_to_weightsfile weightsdir_to_weightsfile.cpp Weights.cpp)
+add_executable(weightsdir_to_weightsfile weightsdir_to_weightsfile.cpp ../common/Weights.cpp)
 target_link_libraries(weightsdir_to_weightsfile PRIVATE Halide::Runtime)
 
 # =================================================================
@@ -131,7 +131,7 @@ set_tests_properties(test_perfect_hash_map
 
 ##
 
-add_executable(test_function_dag test_function_dag.cpp FunctionDAG.cpp ASLog.cpp)
+add_executable(test_function_dag test_function_dag.cpp FunctionDAG.cpp ../common/ASLog.cpp)
 target_link_libraries(test_function_dag PRIVATE Halide::Halide Halide::Tools Halide::Plugin)
 
 add_test(NAME test_function_dag COMMAND test_function_dag)

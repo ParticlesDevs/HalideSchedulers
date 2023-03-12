@@ -2,9 +2,11 @@
 // templated such that it can be compiled in either forward or
 // backwards mode, for inference or training respectively.
 
+#include <utility>
+
 #include "Halide.h"
 
-#include "../common/NetworkSize.h"
+#include "NetworkSize.h"
 #include "cost_model_schedule.h"
 
 using namespace Halide;
@@ -21,12 +23,18 @@ struct ModelWeight<false> : public GeneratorInput<Buffer<float>> {
     ModelWeight(const std::string &name, int dim)
         : GeneratorInput<Buffer<float>>(name, dim) {
     }
-    void backprop(const Derivative &d, Expr learning_rate, Expr timestep) {
+    void backprop(const Derivative &d, const Expr &learning_rate, const Expr &timestep) {
     }
     void set_shape(int s0 = 0, int s1 = 0, int s2 = 0) {
-        if (s0) dim(0).set_bounds(0, s0);
-        if (s1) dim(1).set_bounds(0, s1);
-        if (s2) dim(2).set_bounds(0, s2);
+        if (s0) {
+            dim(0).set_bounds(0, s0);
+        }
+        if (s1) {
+            dim(1).set_bounds(0, s1);
+        }
+        if (s2) {
+            dim(2).set_bounds(0, s2);
+        }
     }
 };
 
@@ -37,10 +45,11 @@ struct ModelWeight<true> : public GeneratorInput<Buffer<float>> {
     ModelWeight(const std::string &name, int dim)
         : GeneratorInput<Buffer<float>>(name, dim), grad("updated_" + name, dim + 1) {
     }
-    void backprop(const Derivative &d, Expr learning_rate, Expr timestep) {
+    void backprop(const Derivative &d, Expr learning_rate, const Expr &timestep) {
         std::vector<Expr> args(dimensions() + 1);
-        for (auto &e : args)
+        for (auto &e : args) {
             e = Var();
+        }
         grad(args) = undef<float>();
 
         // We'll report back the new weights and the loss gradients,
@@ -71,7 +80,7 @@ struct ModelWeight<true> : public GeneratorInput<Buffer<float>> {
         Expr smoothed_second_moment_correction = 1 / (1 - pow(0.999f, timestep + 1));
 
         // Update the weights
-        Expr step = learning_rate * smoothed_deriv * smoothed_deriv_correction;
+        Expr step = std::move(learning_rate) * smoothed_deriv * smoothed_deriv_correction;
         step /= sqrt(smoothed_second_moment * smoothed_second_moment_correction) + 1e-5f;
 
         new_weight = current_weight - step;
@@ -127,6 +136,10 @@ public:
     // Number of cores on the target machine. Used to reason about idle cores.
     Input<int> num_cores{"num_cores", 1};
 
+    Input<int> batch_id{"batch_id", 0};
+
+    GeneratorParam<bool> enable_debug_output{"enable_debug_output", false};
+
     // Algorithm-specific features
     Input<Buffer<float>> pipeline_features{"pipeline_features", 3};
 
@@ -158,24 +171,35 @@ public:
     // The predicted runtimes
     Output<Buffer<float>> prediction_output{"prediction_output", 1};
 
+    // Predicted per stage run times
+    Output<Buffer<float>> cost_per_stage_output{"cost_per_stage_output", 2};
+
     // The loss. L2 on relative throughput.
     Output<Buffer<float>> loss_output{"loss_output", 0};
 
     // Zero pad alone the last dimension of a Func
-    Func pad_stages(Func f, Expr stages) {
+    Func pad_stages(const Func &f, Expr stages) {
         Halide::Region bounds(f.dimensions());
         bounds[1].min = 0;
-        bounds[1].extent = stages;
+        bounds[1].extent = std::move(stages);
         return BoundaryConditions::constant_exterior(f, cast(f.value().type(), 0), bounds);
     }
 
-    Expr activation(Expr e) {
-        // relu
-        return max(e, 0);
+    Expr activation(const Expr &e) {
+        // leaky relu
+        return max(e, 0) + min(e, 0) * 1e-10f;
     }
 
     Expr sigmoid(Expr e) {
-        return 1 / (1 + exp(-e));
+        return 1 / (1 + exp(-std::move(e)));
+    }
+
+    Expr print_wrap(Expr e, const std::string &out, const Var &n, const Var &w) {
+        if (training || !enable_debug_output) {
+            return e;
+        }
+
+        return print(e, "<-", out + ".", "batch_id =", batch_id, "pipeline_id =", n, "stage_id =", w);
     }
 
     void generate() {
@@ -240,6 +264,7 @@ public:
         Expr num_productions = schedule_features(n, idx++, w);
         Expr points_computed_per_realization = schedule_features(n, idx++, w);
         Expr points_computed_per_production = schedule_features(n, idx++, w);
+        Expr points_computed_per_thread = schedule_features(n, idx++, w);
         Expr points_computed_total = schedule_features(n, idx++, w);
         Expr points_computed_minimum = schedule_features(n, idx++, w);
         Expr innermost_loop_extent = schedule_features(n, idx++, w);
@@ -254,76 +279,192 @@ public:
         Expr innermost_bytes_at_production = schedule_features(n, idx++, w);
         Expr innermost_bytes_at_root = schedule_features(n, idx++, w);
         Expr inlined_calls = schedule_features(n, idx++, w);
-        Expr unique_bytes_read_per_realization = schedule_features(n, idx++, w);
-        Expr unique_lines_read_per_realization = schedule_features(n, idx++, w);
-        Expr allocation_bytes_read_per_realization = schedule_features(n, idx++, w);
+
+        Expr unique_global_bytes_read_per_realization = schedule_features(n, idx++, w);
+        Expr unique_shared_bytes_read_per_realization = schedule_features(n, idx++, w);
+        Expr unique_register_bytes_read_per_realization = schedule_features(n, idx++, w);
+        Expr unique_global_lines_read_per_realization = schedule_features(n, idx++, w);
+        Expr unique_shared_lines_read_per_realization = schedule_features(n, idx++, w);
+        Expr unique_register_lines_read_per_realization = schedule_features(n, idx++, w);
+
+        Expr unique_global_bytes_read_per_thread = schedule_features(n, idx++, w);
+        Expr unique_shared_bytes_read_per_thread = schedule_features(n, idx++, w);
+        Expr unique_register_bytes_read_per_thread = schedule_features(n, idx++, w);
+        Expr unique_global_lines_read_per_thread = schedule_features(n, idx++, w);
+        Expr unique_shared_lines_read_per_thread = schedule_features(n, idx++, w);
+        Expr unique_register_lines_read_per_thread = schedule_features(n, idx++, w);
+
+        Expr global_allocation_bytes_read_per_realization = schedule_features(n, idx++, w);
+        Expr shared_allocation_bytes_read_per_realization = schedule_features(n, idx++, w);
+        Expr register_allocation_bytes_read_per_realization = schedule_features(n, idx++, w);
         Expr working_set = schedule_features(n, idx++, w);
-        Expr vector_size = schedule_features(n, idx++, w);
-        Expr native_vector_size = schedule_features(n, idx++, w);
-        Expr num_vectors = schedule_features(n, idx++, w);
         Expr num_scalars = schedule_features(n, idx++, w);
-        Expr scalar_loads_per_vector = schedule_features(n, idx++, w);
-        Expr vector_loads_per_vector = schedule_features(n, idx++, w);
-        Expr scalar_loads_per_scalar = schedule_features(n, idx++, w);
-        Expr bytes_at_task = schedule_features(n, idx++, w);
-        Expr innermost_bytes_at_task = schedule_features(n, idx++, w);
-        Expr unique_bytes_read_per_vector = schedule_features(n, idx++, w);
-        Expr unique_lines_read_per_vector = schedule_features(n, idx++, w);
+        Expr global_bytes_at_task = schedule_features(n, idx++, w);
+        Expr shared_bytes_at_task = schedule_features(n, idx++, w);
+        Expr register_bytes_at_task = schedule_features(n, idx++, w);
+        Expr global_innermost_bytes_at_task = schedule_features(n, idx++, w);
+        Expr shared_innermost_bytes_at_task = schedule_features(n, idx++, w);
+        Expr register_innermost_bytes_at_task = schedule_features(n, idx++, w);
+        Expr unique_bytes_read_per_point = schedule_features(n, idx++, w);
+        Expr unique_lines_read_per_point = schedule_features(n, idx++, w);
         Expr unique_bytes_read_per_task = schedule_features(n, idx++, w);
         Expr unique_lines_read_per_task = schedule_features(n, idx++, w);
         Expr working_set_at_task = schedule_features(n, idx++, w);
         Expr working_set_at_production = schedule_features(n, idx++, w);
         Expr working_set_at_realization = schedule_features(n, idx++, w);
         Expr working_set_at_root = schedule_features(n, idx++, w);
+
+        Expr num_blocks = schedule_features(n, idx++, w);
+        Expr num_warps_per_block = schedule_features(n, idx++, w);
+        Expr block_occupancy = schedule_features(n, idx++, w);
+
+        Expr warp_lane_utilization = schedule_features(n, idx++, w);
+        Expr num_active_warps_per_block = schedule_features(n, idx++, w);
+        Expr warp_lane_utilization_at_block_y = schedule_features(n, idx++, w);
+        Expr warp_lane_utilization_at_block_z = schedule_features(n, idx++, w);
+        Expr idle_lane_wastage = schedule_features(n, idx++, w);
+
+        Expr num_shared_mem_loads_per_block = schedule_features(n, idx++, w);
+        Expr num_global_mem_loads_per_block = schedule_features(n, idx++, w);
+        Expr num_shared_mem_stores_per_block = schedule_features(n, idx++, w);
+        Expr num_global_mem_stores_per_block = schedule_features(n, idx++, w);
+
+        Expr shared_mem_store_efficiency = schedule_features(n, idx++, w);
+        Expr shared_mem_load_efficiency = schedule_features(n, idx++, w);
+
+        Expr global_mem_store_efficiency = schedule_features(n, idx++, w);
+        Expr global_mem_load_efficiency = schedule_features(n, idx++, w);
+
+        Expr working_set_at_thread = schedule_features(n, idx++, w);
+
+        Expr shared_mem_occupancy = schedule_features(n, idx++, w);
+        Expr shared_mem_block_limit_factor = schedule_features(n, idx++, w);
+        Expr max_warp_occupancy = schedule_features(n, idx++, w);
+        Expr max_block_occupancy = schedule_features(n, idx++, w);
+
+        Expr num_threads_per_block = schedule_features(n, idx++, w);
+        Expr expr_branching = schedule_features(n, idx++, w);
+
         assert(idx == head2_w);
+
+        num_blocks = max(1, num_blocks);
 
         // Count up the number of things computed, applying a
         // different cost to vectors and scalars, and a different cost
         // depending on whether we were inlined.
         Expr compute_cost = select(inlined_calls == 0,
-                                   (vector_size * num_vectors * relu1(0, w, n) +
-                                    num_scalars * relu1(1, w, n)),
-                                   (vector_size * num_vectors * relu1(2, w, n) +
-                                    num_scalars * relu1(3, w, n)));
+                                   num_scalars * relu1(1, w, n),
+                                   num_scalars * relu1(3, w, n));
 
-        // Round up these costs according to how neatly we're using
-        // our cores.
+        compute_cost = print_wrap(compute_cost, "compute_cost_initial", n, w);
+
+        compute_cost += select(inlined_calls == 0,
+                               (num_blocks * num_threads_per_block * points_computed_per_thread * relu1(19, w, n)),
+                               (num_blocks * num_threads_per_block * points_computed_per_thread * relu1(4, w, n)));
+
+        compute_cost = print_wrap(compute_cost, "compute_cost_after_warps", n, w);
+
         Expr num_tasks = max(1, inner_parallelism * outer_parallelism);
         Expr tasks_per_core = num_tasks / num_cores;
         Expr idle_core_wastage = ceil(tasks_per_core) / max(1, tasks_per_core);
         compute_cost *= idle_core_wastage;
 
+        compute_cost = print_wrap(compute_cost, "compute_cost_after_idle_core_wastage", n, w);
+
+        // Ignore for inlined stages
+        // Serial loops use a single thread
+
+        compute_cost /= select(inlined_calls == 0, 1 - idle_lane_wastage, 1.f);
+        compute_cost = print_wrap(compute_cost, "compute_cost_after_idle_lane", n, w);
+
+        expr_branching = max(1, relu1(23, w, n) * expr_branching);
+        expr_branching = print_wrap(expr_branching, "expr_branching", n, w);
+
+        num_threads_per_block = print_wrap(num_threads_per_block, "num_threads_per_block", n, w);
+
+        Expr num_registers_available_per_thread = min(64.f, 65536.f / num_threads_per_block);
+        Expr num_registers_per_block = num_threads_per_block * min(num_registers_available_per_thread, expr_branching);
+        Expr max_theoretical_active_blocks = max(1.f, floor(65536.f / num_registers_per_block));
+        Expr max_active_blocks = min(max_theoretical_active_blocks, 32.f);
+
+        Expr register_block_occupancy = print_wrap(select(inlined_calls == 0, max_active_blocks / 32.f, 1.f), "register_block_occupancy", n, w);
+
+        // compute_cost *= select(inlined_calls == 0, 1.f / register_block_occupancy, 1.f);
+        compute_cost = print_wrap(compute_cost, "compute_cost_after_register_block_occupancy", n, w);
+
         // Next comes a long list of plausible terms to capture the cost of loads.
-        Expr load_cost = (num_realizations * unique_lines_read_per_realization * relu1(5, w, n) +
-                          num_realizations * unique_bytes_read_per_realization * relu1(6, w, n) +
-                          num_vectors * scalar_loads_per_vector * relu1(7, w, n) +
-                          num_scalars * scalar_loads_per_scalar * relu1(8, w, n) +
-                          num_vectors * vector_loads_per_vector * relu1(9, w, n) +
-                          num_scalars * unique_bytes_read_per_vector * relu1(10, w, n) +
-                          num_vectors * unique_bytes_read_per_vector * relu1(11, w, n) +
-                          num_scalars * unique_lines_read_per_vector * relu1(12, w, n) +
-                          num_vectors * unique_lines_read_per_vector * relu1(13, w, n) +
-                          num_tasks * unique_bytes_read_per_task * relu1(14, w, n) +
-                          num_tasks * unique_lines_read_per_task * relu1(15, w, n));
+        Expr load_cost = num_realizations * unique_global_lines_read_per_realization * relu1(5, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_realizations * unique_global_lines_read_per_realization", n, w);
 
-        // Next we have the cost of stores.
-        Expr lines_written_per_realization = inner_parallelism * (bytes_at_task / max(1, innermost_bytes_at_task));
+        load_cost += num_realizations * unique_shared_lines_read_per_realization * relu1(16, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_realizations * unique_shared_lines_read_per_realization", n, w);
 
-        // Use separate coefficients for things with internal
-        // parallelism, because for stages with internal parallelism,
-        // most values of the values being stored will be consumed on
-        // another core, so they will get punted out to L3 no matter
-        // how small. Also use a separate term for the final stage, as
-        // we never pay the cost of loading from it.
-        Expr alpha = select(inner_parallelism > 1, relu1(16, w, n),
-                            w == 0, relu1(17, w, n),
-                            relu1(18, w, n));
-        Expr beta = select(inner_parallelism > 1, relu1(19, w, n),
-                           w == 0, relu1(20, w, n),
-                           relu1(21, w, n));
+        load_cost += num_realizations * unique_register_lines_read_per_realization * relu1(8, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_realizations * unique_register_lines_read_per_realization", n, w);
 
-        Expr store_cost = num_realizations * (lines_written_per_realization * alpha +
-                                              bytes_at_realization * beta);
+        load_cost += num_realizations * unique_global_bytes_read_per_realization * relu1(6, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_realizations * unique_global_bytes_read_per_realization", n, w);
+
+        load_cost += num_realizations * unique_shared_bytes_read_per_realization * relu1(20, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_realizations * unique_shared_bytes_read_per_realization", n, w);
+
+        load_cost += num_realizations * unique_register_bytes_read_per_realization * relu1(7, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_realizations * unique_register_bytes_read_per_realization", n, w);
+
+        load_cost += num_blocks * num_threads_per_block * unique_global_lines_read_per_thread * relu1(18, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_blocks * num_threads_per_block * unique_global_lines_read_per_thread", n, w);
+
+        load_cost += num_blocks * num_threads_per_block * unique_shared_lines_read_per_thread * relu1(17, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_blocks * num_threads_per_block * unique_shared_lines_read_per_thread", n, w);
+
+        load_cost += num_blocks * num_threads_per_block * unique_register_lines_read_per_thread * relu1(2, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_blocks * num_threads_per_block * unique_register_lines_read_per_thread", n, w);
+
+        load_cost += num_blocks * num_threads_per_block * unique_global_bytes_read_per_thread * relu1(13, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_blocks * num_threads_per_block * unique_global_bytes_read_per_thread", n, w);
+
+        load_cost += num_blocks * num_threads_per_block * unique_shared_bytes_read_per_thread * relu1(11, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_blocks * num_threads_per_block * unique_shared_bytes_read_per_thread", n, w);
+
+        load_cost += num_blocks * num_threads_per_block * unique_register_bytes_read_per_thread * relu1(0, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_blocks * num_threads_per_block * unique_register_bytes_read_per_thread", n, w);
+
+        load_cost += num_scalars * unique_bytes_read_per_point * relu1(10, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_scalars * unique_bytes_read_per_point", n, w);
+
+        load_cost += num_scalars * unique_lines_read_per_point * relu1(12, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_scalars * unique_lines_read_per_point", n, w);
+
+        load_cost += num_tasks * unique_bytes_read_per_task * relu1(14, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_tasks * unique_bytes_read_per_task", n, w);
+
+        load_cost += num_tasks * unique_lines_read_per_task * relu1(15, w, n);
+        load_cost = print_wrap(load_cost, "load_cost after num_tasks * unique_lines_read_per_task", n, w);
+
+        Expr global_mem_load_cost = num_blocks * num_global_mem_loads_per_block * relu1(28, w, n);
+
+        global_mem_load_cost = print_wrap(global_mem_load_cost, "global_mem_load_cost", n, w);
+
+        global_mem_load_cost *= select(inlined_calls == 0, 1.f / global_mem_load_efficiency, 1);
+        global_mem_load_cost = print_wrap(global_mem_load_cost, "global_mem_load_cost_after_load_efficiency", n, w);
+
+        Expr shared_mem_load_cost = num_blocks * num_shared_mem_loads_per_block * relu1(27, w, n);
+
+        shared_mem_load_cost = print_wrap(shared_mem_load_cost, "shared_mem_load_cost_after_load_efficiency", n, w);
+
+        load_cost += global_mem_load_cost + shared_mem_load_cost;
+
+        // Store costs
+        Expr shared_mem_store_cost = num_blocks * num_shared_mem_stores_per_block * relu1(29, w, n);
+
+        shared_mem_store_cost = print_wrap(shared_mem_store_cost, "shared_mem_store_cost_after_store_efficiency", n, w);
+
+        Expr global_mem_store_cost = num_blocks * num_global_mem_stores_per_block * relu1(21, w, n);
+        global_mem_store_cost *= select(inlined_calls == 0, 1.f / global_mem_store_efficiency, 1);
+
+        global_mem_store_cost = print_wrap(global_mem_store_cost, "global_mem_store_cost_after_store_efficiency", n, w);
+
+        Expr store_cost = shared_mem_store_cost + global_mem_store_cost;
 
         // Now account for false sharing of cache lines. The
         // probability of a store hitting a cache line also hit by
@@ -332,24 +473,11 @@ public:
         // store.
         Expr cost_of_false_sharing =
             select(inner_parallelism > 1,
-                   relu1(22, w, n) * (num_vectors + num_scalars) / max(1, innermost_bytes_at_task),
+                   relu1(22, w, n) * (num_scalars) / max(1, global_innermost_bytes_at_task),
                    0.0f);
 
         store_cost += cost_of_false_sharing;
-
-        // Now add a term for false sharing of pages. The maximum
-        // number of threads that could all fault on the same page at
-        // the same time is:
-        Expr max_threads_hitting_same_page_fault = min(inner_parallelism, 4096 / max(1, innermost_bytes_at_task));
-
-        // The total number of page faults is proportionate to the number of bytes allocated
-        Expr num_page_faults = bytes_at_production;
-
-        // And page faults are serviced serially, so the total CPU time gets multiplied by the thread count again!
-        Expr cost_of_page_faults = (num_page_faults * max_threads_hitting_same_page_fault *
-                                    inner_parallelism * outer_parallelism * relu1(23, w, n));
-
-        store_cost += cost_of_page_faults;
+        store_cost = print_wrap(store_cost, "store_cost_after_false_sharing", n, w);
 
         // Malloc is not free, so add a cost per allocation.
         Expr cost_of_malloc = relu1(24, w, n) * num_realizations;
@@ -365,32 +493,30 @@ public:
         // Make it easier for the model to penalize working sets that
         // start to fall out of cache by giving it a term that gets
         // multiplied by the working set.
-        Expr cost_of_working_set = working_set * relu1(27, w, n);
+        Expr cost_of_working_set = working_set * relu1(9, w, n);
 
-        // FIXME: For our best set of trained weights, store_cost was
-        // accidentally in the list below twice, so we double it here
-        // in order to not have to retrain.
-        store_cost *= 2;
+        Expr cost = (print_wrap(compute_cost, "compute_cost_total", n, w) +
+                     print_wrap(store_cost, "store_cost_total", n, w) +
+                     print_wrap(load_cost, "load_cost_total", n, w) +
+                     print_wrap(cost_of_malloc, "cost_of_malloc_total", n, w) +
+                     print_wrap(cost_of_parallelism, "cost_of_parallelism_total", n, w) +
+                     print_wrap(cost_of_working_set, "cost_of_working_set_total", n, w));
 
-        Expr cost = (compute_cost +
-                     store_cost +
-                     load_cost +
-                     cost_of_malloc +
-                     cost_of_parallelism +
-                     cost_of_working_set);
+        cost = print_wrap(cost, "cost_total", n, w);
 
-        for (int i = 0; i < 32; i++) {
+        for (int i = 0; i < conv1_channels; i++) {
             cost += 0.0f * relu1(i, w, n);
         }
 
         Func runtime_per_stage;
         // Change units so that network weights are in a human-readable range.
         runtime_per_stage(n, w) = cost * 1e-9f;
+        cost_per_stage_output(n, w) = runtime_per_stage(n, w);
 
         // Sum across the stages.
         Func prediction;
         RDom r_reduce(0, num_stages);
-        prediction(n) += runtime_per_stage(n, r_reduce);
+        prediction(n) += cost_per_stage_output(n, r_reduce);
 
         prediction_output(n) = prediction(n);
 
@@ -461,11 +587,13 @@ public:
         // itself!). We do that offline and check in the generated
         // schedule source, so that bugs in our autoscheduler don't
         // cause build nightmares due to the circular dependency.
-        num_cores.set_estimate(32);
+        batch_id.set_estimate(0);
+        num_cores.set_estimate(80);
         reference.set_estimate(0);
         batch_size.set_estimate(80);
         num_stages.set_estimate(13);
         prediction_output.set_estimates({{0, 80}});
+        cost_per_stage_output.set_estimates({{0, 80}, {0, 13}});
         learning_rate.set_estimate(0.001f);
         timestep.set_estimate(37);
         pipeline_features.set_estimates({{0, head1_w}, {0, head1_h}, {0, 13}});
@@ -485,16 +613,19 @@ public:
             prediction_output.compute_root().split(n, no, n, 8).parallel(no);
             prediction_output.bound(n, 0, batch_size);
 
+            cost_per_stage_output.reorder(w, n);
+            cost_per_stage_output.specialize(batch_size < 8).split(n, no, n, 1);
+            cost_per_stage_output.compute_root().split(n, no, n, 8).parallel(no);
+
             // schedule for the forwards path
             const int vec = 8;
 
             // A helper function for scheduling conv layers
-            auto schedule_conv = [&](Func conv, Func relu, RVar r_channels) {
-                Var ci, wi;
+            auto schedule_conv = [&](Func conv, Func relu, const RVar &r_channels) {
+                Var ci("ci"), wi("wi");
                 if (!training) {
                     relu
-                        .compute_at(prediction_output, n)
-                        .store_at(prediction_output, no)
+                        .compute_at(cost_per_stage_output, n)
                         .tile(c, w, ci, wi, vec, 4, TailStrategy::RoundUp)
                         .vectorize(ci);
                     conv.compute_at(relu, c);
@@ -532,7 +663,7 @@ public:
             // across the batch.
             if (!training) {
                 normalized_schedule_features
-                    .compute_at(prediction_output, no)
+                    .compute_at(cost_per_stage_output, n)
                     .vectorize(n);
             } else {
                 normalized_schedule_features

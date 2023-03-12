@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <utility>
+#include <cassert>
 
 namespace Halide {
 namespace Internal {
@@ -19,7 +20,11 @@ public:
     aslog(int verbosity)
         : logging(verbosity <= aslog_level()) {
     }
-
+    std::ostream &get_ostream() {
+        // It is an error to call this for an aslog() instance that cannot log.
+        assert(logging);
+        return std::cerr;
+    }
     template<typename T>
     aslog &operator<<(T &&x) {
         if (logging) {

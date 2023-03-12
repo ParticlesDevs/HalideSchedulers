@@ -3,7 +3,7 @@
 #include <fstream>
 #include <iostream>
 
-#include "Weights.h"
+#include "../common/Weights.h"
 
 // Utility to convert from the old dir-of-raw-data into a new .weights file.
 // Should live only long enough for downstream users to convert existing data files
